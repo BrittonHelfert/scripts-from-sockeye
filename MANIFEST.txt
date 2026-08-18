@@ -1,0 +1,183 @@
+MANIFEST — Sockeye scripts for the SSc-ILD paper repository
+Paper: "Fibrotic image features in the skin are predictive of interstitial lung
+disease in patients with systemic sclerosis"
+Assembled 2026-08-18 from /scratch/st-singha53-1/bhelfert/CBL/scripts/
+(git repo, main @ cd875f3). Verified against "SSc Paper Draft v3.md" (methods)
+and the .meta.json provenance files next to the final feature matrices in
+/scratch/st-singha53-1/bhelfert/CBL/output/feature_matrices/.
+
+=====================================================================
+PIPELINE OVERVIEW (paper-final CONCH/UNI embeddings, e.g. uni_hne_mmean.csv,
+conch_tri_mmean.csv)
+=====================================================================
+ 1. TRIDENT segmentation + tiling + raw embeddings   (GPU)
+      H&E:       embeddings/trident_extract_hne_uni_resnet.sh
+      Trichrome: embeddings/extract_wsi_features.sh  (conch_trichrome / resnet_trichrome)
+ 2. Contour cleanup: contours/drop_debris_from_contours.py
+ 3. Cohort-median stain reference (CPU):
+      embeddings/compute_cohort_stain_reference.py  (via run_cohort_reference.sh)
+ 4. Re-encode tiles after stain normalization to the cohort median (GPU):
+      embeddings/extract_cohort_normed_features.py  (via run_cohort_normed_features.sh)
+      H&E -> Vahadane, trichrome -> Reinhard  (see docs/NORMALIZATION_NOTES.md)
+ 5. Pool per-sample matrices (CPU):
+      embeddings/build_normed_matrices.py --pool mean   -> *_mmean.csv  (PAPER-FINAL)
+      embeddings/build_normed_matrices.py --pool l2     -> *_mnorm.csv  (variant)
+
+=====================================================================
+common/  — shared preprocessing package
+=====================================================================
+common/__init__.py         Package marker ("Shared preprocessing utilities").
+common/contour_assign.py   Clusters TRIDENT contour polygons into per-sample groups
+                           (centroid-x-gap clustering, debris drop at <5% of the
+                           cluster's largest polygon), then assigns each embedding
+                           patch to the sample tissue it overlaps most; off-tissue
+                           patches dropped. Used by build_normed_matrices.py,
+                           repool_contour_embeddings.py, add_vsr346.py, and the
+                           interp extractors. Deps: numpy, shapely.
+common/wsi_io.py           WSI loading (openslide), TRIDENT GeoJSON parsing
+                           (load_tissue_polygons), polygon->sample assignment,
+                           mask rasterization (rasterize_polygons).
+                           Deps: numpy, openslide, shapely, skimage.
+No other local imports — the package is self-contained.
+
+=====================================================================
+embeddings/  — DL embedding extraction (PAPER-FINAL chain)
+=====================================================================
+trident_extract_hne_uni_resnet.sh
+    SLURM/TRIDENT launcher for the H&E WSIs: UNI v1 (1024-d, 256px @ 20x),
+    CONCH v1 on H&E (exploratory, not used), ResNet50 (256px @ 20x). This is the
+    run that produced output/features/uni_v1_hne and resnet50_hne_20x (job-dir
+    confirmed against the TRIDENT _config_*.json in the feature dirs).
+    RECOVERED FROM GIT (commit df1e354, path
+    investigation/his_features/feature_extraction/extract.sh) — it was later
+    deleted from the working tree; content is verbatim.
+extract_wsi_features.sh
+    Current SLURM/TRIDENT launcher, original WSIs: CONCH v1 trichrome
+    (512-d, 512px @ 20x, --segmenter hest --seg_conf_thresh 0.4)  [PAPER-FINAL
+    CONCH extraction], ResNet50 trichrome (256px @ 20x), ResNet50 H&E 40x and
+    GigaPath (neither in the paper).
+compute_cohort_stain_reference.py + run_cohort_reference.sh
+    Stage 1: per-slide stain stats from TRIDENT tissue patches at level 0
+    (background masked), cohort target = element-wise MEDIAN. H&E: Vahadane
+    stain matrix + max-conc; trichrome: Reinhard LAB mean/std. Writes
+    output/stain_references/cohort_stain_reference_{hne,trichrome}.npz.
+cohort_norm.py
+    Shared transforms for stages 1-2 (Vahadane/Reinhard to the cohort median).
+    Imports the Vahadane primitives from stain_normalize.py.
+extract_cohort_normed_features.py + run_cohort_normed_features.sh
+    Stage 2: re-reads the TRIDENT tile coords, normalizes each tile
+    source->cohort-median, re-encodes with the same encoder. Writes
+    features_<enc>_vahadane_med (H&E) / features_<enc>_reinhardmed (trichrome).
+stain_normalize.py
+    VahadaneNormalizer / ReinhardNormalizer classes + OD helpers. Dependency of
+    cohort_norm.py and extract_normalized_features.py.
+build_normed_matrices.py + run_build_normed_matrices.sh
+    Final pooling. Assigns tiles to samples via common.contour_assign
+    (debris_frac=0.05), then pools per sample:
+      --pool mean -> plain mean of raw tile embeddings -> *_mmean.csv
+                     *** THIS PRODUCED uni_hne_mmean.csv AND conch_tri_mmean.csv
+                     (and resnet_{hne,tri}_mmean.csv), n=55, confirmed via the
+                     .meta.json written alongside each matrix. ***
+      --pool l2   -> per-tile L2-normalize then mean -> *_mnorm.csv (variant).
+    NOTE: "_mnorm" is per-tile L2 normalization in this code, NOT min-max
+    (the biomni_scripts/SSc_ILD_project_summary.md description "min-max per
+    feature" does not match the code that made the final matrices).
+
+=====================================================================
+resnet_exploratory/  — ResNet-50 matrices (resnet_hne_norm.csv,
+resnet_tri_norm.csv; exploratory, not in the final paper)
+=====================================================================
+extract_normalized_features.py + run_extract_normalized_features.sh
+    Older single-reference normalization pipeline: Vahadane to the
+    vsr289_thumbnail.png reference (H&E) / Reinhard to
+    vsr289_trichrome_thumbnail.png (trichrome), re-encode tiles. Writes
+    features_<enc>_vahadane / features_<enc>_reinhard.
+collect_stain_references.py
+    Built the reference-thumbnail library (incl. the vsr289 thumbnails above).
+export_vahadane_matrices.py
+    Mean-pooled these into resnet_hne_norm.csv / resnet_tri_norm.csv (original
+    x-gap tile->sample split; excluded vsr346).
+repool_contour_embeddings.py + run_repool_contour_embeddings.sh
+    Corrected 8 flagged slides in-place by contour-containment assignment
+    (debris flecks + the vsr344/vsr346 x-overlap); backs up to
+    _pre_contour_fix/.
+add_vsr346.py
+    Re-added vsr346 (dcSSc-noILD) rows to the matrices via contour containment
+    -> final n=55 cohort. The resnet_*_norm.csv used in analysis =
+    export_vahadane_matrices.py output + repool fix + vsr346 row.
+
+=====================================================================
+contours/
+=====================================================================
+drop_debris_from_contours.py
+    Removes flagged debris polygons from the TRIDENT contour GeoJSONs (same
+    <5%-of-largest rule). The cleaned GeoJSONs are the single source of truth
+    consumed by every pooling/interp/QC step downstream.
+
+=====================================================================
+interp_launchers/  — SLURM wrappers for the interpretable-feature extractors
+(you already have extract_he_interp_features.py /
+extract_trichrome_interp_features.py; these are their launchers)
+=====================================================================
+run_he_interp.sh          SLURM array (one H&E slide per task, 18 slides) ->
+                          extract_he_interp_features.py. CPU, trident_env.
+run_trichrome_interp.sh   Same for trichrome -> extract_trichrome_interp_features.py.
+aggregate_interp_v2.py    Aggregates the per-slide CSVs into the cohort feature
+                          matrices interp_hne_v2.csv / interp_tri_v2.csv.
+NOTE: these Sockeye array runs were RAW (no stain normalization; see the header
+comments). The paper methods state Macenko (H&E) / Reinhard (trichrome)
+normalization for the interp features — that corresponds to the extractors'
+--normalize scan / --normalize apply two-pass mode (with
+macenko_median_normalize.py / reinhard_median_normalize.py, which you already
+have). Verify which run produced the interp CSVs you actually modelled.
+
+=====================================================================
+env/
+=====================================================================
+trident_env_freeze.txt           Full `pip freeze` of the trident_env conda env
+                                 (GPU extraction + interp arrays ran here).
+trident_env_freeze_filtered.txt  Trimmed version.
+
+=====================================================================
+docs/
+=====================================================================
+NORMALIZATION_NOTES.md
+    Diagnostic evidence for why H&E uses Vahadane rather than Macenko in the
+    embedding pipeline (Macenko is degenerate on this collagen-dominated
+    cohort: near-collinear H/E vectors -> gray collapse). Relevant to the
+    Methods wording: the paper's embedding section says "stain-normalised to
+    the cohort median stain metrics" without naming the method — the method
+    actually used for the CONCH/UNI tiles was Vahadane (H&E) / Reinhard
+    (trichrome), not Macenko.
+
+=====================================================================
+TRIDENT — segmentation + tiling + base embeddings
+=====================================================================
+No custom wrapper beyond the two .sh launchers above; TRIDENT was invoked as
+  python run_batch_of_slides.py --task all --wsi_dir <SVS dir> --job_dir <out>
+    --patch_encoder {uni_v1|conch_v1|resnet50} --patch_size {256|512} --mag 20
+    --batch_size {128|256} --max_workers 8
+    [trichrome only: --segmenter hest --seg_conf_thresh 0.4]
+"--task all" performs tissue segmentation (contour GeoJSONs under
+<job_dir>/contours_geojson/), tiling, and feature extraction in one run.
+H&E used TRIDENT's default segmenter at seg_mag 10; trichrome used the HEST
+segmenter with confidence threshold 0.4 (default segmentation missed the
+faint trichrome tissue).
+TRIDENT checkout: /arc/project/st-singha53-1/bhelfert/github_repos/TRIDENT
+  version v0.2.3, commit adf3b7e8fdd7c815f33bec79da0d8d265200c2d6 (2025-11-19).
+
+=====================================================================
+ENVIRONMENTS / SYSTEM DEPENDENCIES
+=====================================================================
+- trident_env (conda): TRIDENT + torch/CUDA, h5py, openslide-python, shapely,
+  scikit-image, timm; used for all GPU extraction, the cohort stain-reference
+  stages, and the interp arrays. See env/trident_env_freeze.txt.
+- histolytics_env (conda): pandas/h5py/shapely stack used for the CPU pooling
+  steps (build_normed_matrices, repool, add_vsr346).
+- Model weights via HuggingFace (HF_TOKEN required): MahmoodLab/UNI (gated),
+  MahmoodLab/CONCH (gated); ResNet50 = torchvision ImageNet weights via
+  TORCH_HOME cache. GigaPath also gated (not needed for the paper).
+- System: openslide C library (for openslide-python), CUDA (V100, fp16 only).
+- All .sh files contain Sockeye-specific paths/accounts (st-singha53-1) and
+  the hub.arc.ubc.ca proxy exports for compute-node internet access; strip or
+  parameterize for the public repo.
